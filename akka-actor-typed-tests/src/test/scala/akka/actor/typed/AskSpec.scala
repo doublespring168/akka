@@ -130,7 +130,6 @@ class AskSpec extends ScalaTestWithActorTestKit with WordSpecLike with LogCaptur
         import scaladsl.AskPattern._
         import akka.actor.typed.scaladsl.adapter._
         implicit val timeout: Timeout = 3.seconds
-        implicit val scheduler = classicSystem.toTyped.scheduler
         val typedLegacy: ActorRef[AnyRef] = legacyActor
         (typedLegacy.ask(Ping)).failed.futureValue should ===(ex)
       } finally {
@@ -176,7 +175,7 @@ class AskSpec extends ScalaTestWithActorTestKit with WordSpecLike with LogCaptur
 
       LoggingTestKit
         .error("Exception thrown out of adapter. Stopping myself.")
-        .intercept {
+        .expect {
           replyRef2 ! 42L
         }(system)
 

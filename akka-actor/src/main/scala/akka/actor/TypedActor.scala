@@ -106,6 +106,7 @@ trait TypedActorFactory {
 @deprecated("Use 'akka.actor.typed' API.", since = "2.6.0")
 object TypedActor extends ExtensionId[TypedActorExtension] with ExtensionIdProvider {
   override def get(system: ActorSystem): TypedActorExtension = super.get(system)
+  override def get(system: ClassicActorSystemProvider): TypedActorExtension = super.get(system)
 
   def lookup() = this
   def createExtension(system: ExtendedActorSystem): TypedActorExtension = new TypedActorExtension(system)
@@ -127,10 +128,6 @@ object TypedActor extends ExtensionId[TypedActorExtension] with ExtensionIdProvi
    */
   @silent("deprecated")
   def get(context: ActorContext): TypedActorFactory = apply(context)
-
-  @deprecated("Use 'akka.actor.typed' API.", since = "2.6.0")
-  @silent("deprecated")
-  override def apply(system: ActorSystem): TypedActorExtension = super.apply(system)
 
   /**
    * This class represents a Method call, and has a reference to the Method to be called and the parameters to supply

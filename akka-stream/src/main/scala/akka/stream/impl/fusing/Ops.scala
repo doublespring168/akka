@@ -15,7 +15,7 @@ import akka.stream.Attributes.{ InputBuffer, LogLevels }
 import akka.stream.OverflowStrategies._
 import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
 import akka.stream.impl.{ ReactiveStreamsCompliance, Buffer => BufferImpl }
-import akka.stream.scaladsl.{ Flow, Keep, Source }
+import akka.stream.scaladsl.{ DelayStrategy, Flow, Keep, Source }
 import akka.stream.stage._
 import akka.stream.{ Supervision, _ }
 
@@ -1405,15 +1405,14 @@ private[stream] object Collect {
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
     new GraphStageLogic(shape) with InHandler with OutHandler with StageLogging {
-
-      private lazy val self = getStageActor {
-        case (_, Terminated(`targetRef`)) =>
-          failStage(new WatchedActorTerminatedException("Watch", targetRef))
-        case (_, _) => // keep the compiler happy (stage actor receive is total)
-      }
+      override protected def logSource: Class[_] = classOf[Watch[_]]
 
       override def preStart(): Unit = {
-        // initialize self, and watch the target
+        val self = getStageActor {
+          case (_, Terminated(`targetRef`)) =>
+            failStage(new WatchedActorTerminatedException("Watch", targetRef))
+          case (_, _) => // keep the compiler happy (stage actor receive is total)
+        }
         self.watch(targetRef)
       }
 
@@ -1701,34 +1700,47 @@ private[stream] object Collect {
 /**
  * INTERNAL API
  */
-@InternalApi private[akka] final class Delay[T](val d: FiniteDuration, val strategy: DelayOverflowStrategy)
-    extends SimpleLinearGraphStage[T] {
-  private[this] def timerName = "DelayedTimer"
+@InternalApi object Delay {
+  private val TimerName = "DelayedTimer"
+  private val DelayPrecisionMS = 10
+}
 
-  final val DelayPrecisionMS = 10
+/**
+ * INTERNAL API
+ */
+@InternalApi private[akka] final class Delay[T](
+    delayStrategySupplier: () => DelayStrategy[T],
+    overflowStrategy: DelayOverflowStrategy)
+    extends SimpleLinearGraphStage[T] {
 
   override def initialAttributes: Attributes = DefaultAttributes.delay
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
     new TimerGraphStageLogic(shape) with InHandler with OutHandler {
-      val size = inheritedAttributes.mandatoryAttribute[InputBuffer].max
+      import Delay._
 
-      val delayMillis = d.toMillis
+      private[this] val size = inheritedAttributes.mandatoryAttribute[InputBuffer].max
 
-      var buffer: BufferImpl[(Long, T)] = _ // buffer has pairs timestamp with upstream element
+      private[this] val delayStrategy = delayStrategySupplier()
 
-      override def preStart(): Unit = buffer = BufferImpl(size, inheritedAttributes)
+      // buffer has pairs of timestamp of expected push and element
+      private[this] val buffer = BufferImpl[(Long, T)](size, inheritedAttributes)
 
-      val onPushWhenBufferFull: () => Unit = strategy match {
+      private[this] val onPushWhenBufferFull: () => Unit = overflowStrategy match {
         case EmitEarly =>
           () => {
-            if (!isTimerActive(timerName))
+            if (isAvailable(out)) {
+              if (isTimerActive(TimerName)) {
+                cancelTimer(TimerName)
+              }
+
               push(out, buffer.dequeue()._2)
-            else {
-              cancelTimer(timerName)
-              onTimer(timerName)
+              grabAndPull()
+              completeIfReady()
+            } else {
+              throw new IllegalStateException(
+                "Was configured to emitEarly and got element when out is not ready and buffer is full, should not be possible.")
             }
-            grabAndPull()
           }
         case _: DropHead =>
           () => {
@@ -1743,7 +1755,7 @@ private[stream] object Collect {
         case _: DropNew =>
           () => {
             grab(in)
-            pull(in)
+            if (shouldPull) pull(in)
           }
         case _: DropBuffer =>
           () => {
@@ -1752,7 +1764,7 @@ private[stream] object Collect {
           }
         case _: Fail =>
           () => {
-            failStage(BufferOverflowException(s"Buffer overflow for delay operator (max capacity was: $size)!"))
+            failStage(new BufferOverflowException(s"Buffer overflow for delay operator (max capacity was: $size)!"))
           }
         case _: Backpressure =>
           () => {
@@ -1765,46 +1777,41 @@ private[stream] object Collect {
           onPushWhenBufferFull()
         else {
           grabAndPull()
-          if (!isTimerActive(timerName)) {
-            // schedule a timer for the full-delay `d` only if the buffer is empty, because otherwise a
-            // full-length timer will starve subsequent `onPull` callbacks, preventing overdue elements
-            // to be discharged.
-            if (buffer.isEmpty)
-              scheduleOnce(timerName, d)
-            else
-              scheduleOnce(timerName, Math.max(DelayPrecisionMS, nextElementWaitTime()).millis)
+          if (!isTimerActive(TimerName)) {
+            val waitTime = nextElementWaitTime()
+            if (waitTime <= DelayPrecisionMS && isAvailable(out)) {
+              push(out, buffer.dequeue()._2)
+              completeIfReady()
+            } else
+              scheduleOnce(TimerName, waitTime.millis)
           }
         }
       }
 
-      def pullCondition: Boolean = strategy match {
-        case EmitEarly =>
-          // when buffer is full we can only emit early if out is available
-          buffer.used < size || isAvailable(out)
-        case _ =>
-          !strategy.isBackpressure || buffer.used < size
-      }
+      private def shouldPull: Boolean =
+        buffer.used < size || !overflowStrategy.isBackpressure ||
+        // we can only emit early if output is ready
+        (overflowStrategy == EmitEarly && isAvailable(out))
 
-      def grabAndPull(): Unit = {
-        if (buffer.used == size) throw new IllegalStateException("Trying to enqueue but buffer is full")
-        buffer.enqueue((System.nanoTime(), grab(in)))
-        if (pullCondition) pull(in)
+      private def grabAndPull(): Unit = {
+        val element = grab(in)
+        buffer.enqueue((System.nanoTime() + delayStrategy.nextDelay(element).toNanos, element))
+        if (shouldPull) pull(in)
       }
 
       override def onUpstreamFinish(): Unit =
         completeIfReady()
 
       def onPull(): Unit = {
-        if (!isTimerActive(timerName) && !buffer.isEmpty) {
+        if (!isTimerActive(TimerName) && !buffer.isEmpty) {
           val waitTime = nextElementWaitTime()
-          if (waitTime < 0) {
+          if (waitTime <= DelayPrecisionMS)
             push(out, buffer.dequeue()._2)
-          } else {
-            scheduleOnce(timerName, Math.max(DelayPrecisionMS, waitTime).millis)
-          }
+          else
+            scheduleOnce(TimerName, waitTime.millis)
         }
 
-        if (!isClosed(in) && !hasBeenPulled(in) && pullCondition)
+        if (!isClosed(in) && !hasBeenPulled(in) && shouldPull)
           pull(in)
 
         completeIfReady()
@@ -1815,19 +1822,14 @@ private[stream] object Collect {
 
       def completeIfReady(): Unit = if (isClosed(in) && buffer.isEmpty) completeStage()
 
-      def nextElementWaitTime(): Long = {
-        delayMillis - NANOSECONDS.toMillis(System.nanoTime() - buffer.peek()._1)
+      private def nextElementWaitTime(): Long = {
+        NANOSECONDS.toMillis(buffer.peek()._1 - System.nanoTime())
       }
 
       final override protected def onTimer(key: Any): Unit = {
         if (isAvailable(out))
           push(out, buffer.dequeue()._2)
 
-        if (!buffer.isEmpty) {
-          val waitTime = nextElementWaitTime()
-          if (waitTime > DelayPrecisionMS)
-            scheduleOnce(timerName, waitTime.millis)
-        }
         completeIfReady()
       }
     }
@@ -2079,10 +2081,13 @@ private[stream] object Collect {
 /**
  * INTERNAL API
  */
-@InternalApi final private[akka] class LazyFlow[I, O, M](flowFactory: I => Future[Flow[I, O, M]])
-    extends GraphStageWithMaterializedValue[FlowShape[I, O], Future[Option[M]]] {
-  val in = Inlet[I]("lazyFlow.in")
-  val out = Outlet[O]("lazyFlow.out")
+@InternalApi private[akka] final class LazyFlow[I, O, M](flowFactory: I => Future[Flow[I, O, M]])
+    extends GraphStageWithMaterializedValue[FlowShape[I, O], Future[M]] {
+
+  // FIXME: when removing the deprecated I => Flow factories we can remove that complication from this stage
+
+  val in = Inlet[I]("LazyFlow.in")
+  val out = Outlet[O]("LazyFlow.out")
 
   override def initialAttributes = DefaultAttributes.lazyFlow
 
@@ -2090,77 +2095,83 @@ private[stream] object Collect {
 
   override def toString: String = "LazyFlow"
 
-  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes) = {
-
-    val matPromise = Promise[Option[M]]()
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[M]) = {
+    val matPromise = Promise[M]()
     val stageLogic = new GraphStageLogic(shape) with InHandler with OutHandler {
-
       var switching = false
 
       //
       // implementation of handler methods in initial state
       //
-
-      override def onPush(): Unit = {
-        val element = grab(in)
-        switching = true
-        val cb = getAsyncCallback[Try[Flow[I, O, M]]] {
-          case Success(flow) =>
-            // check if the stage is still in need for the lazy flow
-            // (there could have been an onUpstreamFailure or onDownstreamFinish in the meantime that has completed the promise)
-            if (!matPromise.isCompleted) {
-              try {
-                val mat = switchTo(flow, element)
-                matPromise.success(Some(mat))
-              } catch {
-                case NonFatal(e) =>
-                  matPromise.failure(e)
-                  failStage(e)
-              }
+      private def onFlowFutureComplete(firstElement: I)(result: Try[Flow[I, O, M]]) = result match {
+        case Success(flow) =>
+          // check if the stage is still in need for the lazy flow
+          // (there could have been an onUpstreamFailure or onDownstreamFinish in the meantime that has completed the promise)
+          if (!matPromise.isCompleted) {
+            try {
+              val mat = switchTo(flow, firstElement)
+              matPromise.success(mat)
+            } catch {
+              case NonFatal(e) =>
+                matPromise.failure(e)
+                failStage(e)
             }
-          case Failure(e) =>
-            matPromise.failure(e)
-            failStage(e)
-        }
+          }
+        case Failure(e) =>
+          matPromise.failure(e)
+          failStage(e)
+      }
+
+      override def onPush(): Unit =
         try {
-          flowFactory(element).onComplete(cb.invoke)(ExecutionContexts.sameThreadExecutionContext)
+          val element = grab(in)
+          switching = true
+          val futureFlow = flowFactory(element)
+
+          // optimization avoid extra scheduling if already completed
+          futureFlow.value match {
+            case Some(completed) =>
+              onFlowFutureComplete(element)(completed)
+            case None =>
+              val cb = getAsyncCallback[Try[Flow[I, O, M]]](onFlowFutureComplete(element))
+              futureFlow.onComplete(cb.invoke)(ExecutionContexts.sameThreadExecutionContext)
+          }
         } catch {
           case NonFatal(e) =>
             matPromise.failure(e)
             failStage(e)
         }
-      }
 
       override def onUpstreamFinish(): Unit = {
+        if (!matPromise.isCompleted)
+          matPromise.tryFailure(new NeverMaterializedException)
         // ignore onUpstreamFinish while the stage is switching but setKeepGoing
         if (switching) {
           setKeepGoing(true)
         } else {
-          matPromise.success(None)
           super.onUpstreamFinish()
         }
       }
 
       override def onUpstreamFailure(ex: Throwable): Unit = {
-        matPromise.failure(ex)
         super.onUpstreamFailure(ex)
-      }
-
-      override def onDownstreamFinish(cause: Throwable): Unit = {
-        matPromise.success(None)
-        super.onDownstreamFinish(cause)
+        if (!matPromise.isCompleted)
+          matPromise.tryFailure(new NeverMaterializedException(ex))
       }
 
       override def onPull(): Unit = {
         pull(in)
       }
 
+      override def postStop(): Unit = {
+        if (!matPromise.isCompleted)
+          matPromise.tryFailure(new AbruptStageTerminationException(this))
+      }
+
       setHandler(in, this)
       setHandler(out, this)
 
       private def switchTo(flow: Flow[I, O, M], firstElement: I): M = {
-
-        var firstElementPushed = false
 
         //
         // ports are wired in the following way:
@@ -2173,6 +2184,7 @@ private[stream] object Collect {
 
         val matVal = Source
           .fromGraph(subOutlet.source)
+          .prepend(Source.single(firstElement))
           .viaMat(flow)(Keep.right)
           .toMat(subInlet.sink)(Keep.left)
           .run()(interpreter.subFusingMaterializer)
@@ -2202,10 +2214,8 @@ private[stream] object Collect {
               subOutlet.push(grab(in))
             }
             override def onUpstreamFinish(): Unit = {
-              if (firstElementPushed) {
-                subOutlet.complete()
-                maybeCompleteStage()
-              }
+              subOutlet.complete()
+              maybeCompleteStage()
             }
             override def onUpstreamFailure(ex: Throwable): Unit = {
               // propagate exception irrespective if the cached element has been pushed or not
@@ -2226,19 +2236,7 @@ private[stream] object Collect {
 
         subOutlet.setHandler(new OutHandler {
           override def onPull(): Unit = {
-            if (firstElementPushed) {
-              pull(in)
-            } else {
-              // the demand can be satisfied right away by the cached element
-              firstElementPushed = true
-              subOutlet.push(firstElement)
-              // in.onUpstreamFinished was not propagated if it arrived before the cached element was pushed
-              // -> check if the completion must be propagated now
-              if (isClosed(in)) {
-                subOutlet.complete()
-                maybeCompleteStage()
-              }
-            }
+            pull(in)
           }
           override def onDownstreamFinish(cause: Throwable): Unit = {
             if (!isClosed(in)) {
@@ -2271,7 +2269,6 @@ private[stream] object Collect {
 
         matVal
       }
-
     }
     (stageLogic, matPromise.future)
   }

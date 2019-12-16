@@ -21,6 +21,7 @@ import akka.io.Dns
 import akka.io.DnsProvider
 import akka.io.SimpleDnsCache
 import akka.io.Tcp._
+import akka.io.dns.DnsProtocol
 import akka.stream._
 import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.Tcp.IncomingConnection
@@ -29,7 +30,7 @@ import akka.stream.scaladsl._
 import akka.stream.testkit._
 import akka.stream.testkit.scaladsl.StreamTestKit._
 import akka.testkit.EventFilter
-import akka.testkit.SocketUtil.temporaryServerAddress
+import akka.testkit.SocketUtil.{ temporaryServerAddress, temporaryServerHostnameAndPort }
 import akka.testkit.TestKit
 import akka.testkit.TestLatch
 import akka.testkit.TestProbe
@@ -40,13 +41,13 @@ import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import org.scalatest.concurrent.PatienceConfiguration
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
+
 import scala.collection.immutable
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
-
 import com.github.ghik.silencer.silent
 
 @silent("never used")
@@ -66,6 +67,7 @@ class NonResolvingDnsManager(ext: akka.io.DnsExt) extends Actor {
   }
 }
 
+@silent("deprecated")
 class FailingDnsResolver extends DnsProvider {
   override val cache: Dns = new Dns {
     override def cached(name: String): Option[Dns.Resolved] = None
@@ -73,6 +75,14 @@ class FailingDnsResolver extends DnsProvider {
       // tricky impl detail this is actually where the resolve response is triggered
       // we fake that it fails directly from here
       sender ! Dns.Resolved(name, immutable.Seq.empty, immutable.Seq.empty)
+      None
+    }
+    override def cached(request: DnsProtocol.Resolve): Option[DnsProtocol.Resolved] = None
+    override def resolve(
+        request: DnsProtocol.Resolve,
+        system: ActorSystem,
+        sender: ActorRef): Option[DnsProtocol.Resolved] = {
+      sender ! DnsProtocol.Resolved(request.name, immutable.Seq.empty, immutable.Seq.empty)
       None
     }
   }
@@ -829,6 +839,25 @@ class TcpSpec extends StreamSpec("""
       } finally sys2.terminate()
     }
 
+    "show host and port in bind exception message" in EventFilter[BindException](occurrences = 1).intercept {
+      val (host, port) = temporaryServerHostnameAndPort()
+      val bind = Tcp(system).bind(host, port)
+
+      val probe1 = TestSubscriber.manualProbe[Tcp.IncomingConnection]()
+      val binding1 = bind.to(Sink.fromSubscriber(probe1)).run().futureValue
+
+      probe1.expectSubscription()
+
+      val probe2 = TestSubscriber.manualProbe[Tcp.IncomingConnection]()
+      val binding2 = bind.to(Sink.fromSubscriber(probe2)).run()
+
+      val thrown = the[BindFailedException] thrownBy Await.result(binding2, 3.seconds)
+      thrown.getMessage should include(host)
+      thrown.getMessage should include(port.toString)
+
+      // clean up
+      binding1.unbind().futureValue
+    }
   }
 
   "TLS client and server convenience methods with SSLEngine setup" should {

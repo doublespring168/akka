@@ -8,9 +8,9 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.util.Failure
 import scala.util.Success
-
 import akka.actor.typed.ActorRef
 import akka.actor.typed.ActorSystem
+import akka.actor.typed.ActorTags
 import akka.actor.typed.Behavior
 import akka.actor.typed.scaladsl.Behaviors
 import org.slf4j.LoggerFactory
@@ -118,7 +118,7 @@ object LoggingDocExamples {
     // implicit ActorSystem is needed, but that is given by ScalaTestWithActorTestKit
     //implicit val system: ActorSystem[_]
 
-    LoggingTestKit.info("Received message").intercept {
+    LoggingTestKit.info("Received message").expect {
       ref ! Message("hello")
     }
     //#test-logging
@@ -134,11 +134,21 @@ object LoggingDocExamples {
         }
       }
       .withOccurrences(2)
-      .intercept {
+      .expect {
         ref ! Message("hellö")
         ref ! Message("hejdå")
       }
     //#test-logging-criteria
+  }
+
+  def tagsExample(): Unit = {
+    Behaviors.setup[AnyRef] { context =>
+      val myBehavior = Behaviors.empty[AnyRef]
+      //#tags
+      context.spawn(myBehavior, "MyActor", ActorTags("processing"))
+      //#tags
+      Behaviors.stopped
+    }
   }
 
 }

@@ -10,16 +10,72 @@ import java.util.ArrayList
 import java.util.Optional
 import java.util.concurrent.CompletionStage
 
+import akka.actor.Address
+import akka.actor.typed.internal.adapter.ActorSystemAdapter
+
 import scala.concurrent.{ ExecutionContextExecutor, Future }
 import scala.reflect.ClassTag
 import scala.util.Try
 import akka.annotation.InternalApi
-import akka.util.OptionVal
+import akka.dispatch.ExecutionContexts
+import akka.util.{ BoxedType, Timeout }
 import akka.util.Timeout
 import akka.util.JavaDurationConverters._
+import akka.util.OptionVal
 import com.github.ghik.silencer.silent
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
+/**
+ * INTERNAL API
+ */
+@InternalApi private[akka] object ActorContextImpl {
+
+  // single context for logging as there are a few things that are initialized
+  // together that we can cache as long as the actor is alive
+  object LoggingContext {
+    def apply(logger: Logger, tags: Set[String], ctx: ActorContextImpl[_]): LoggingContext = {
+      val tagsString =
+        // "" means no tags
+        if (tags.isEmpty) ""
+        else
+          // mdc can only contain string values, and we don't want to render that string
+          // on each log entry or message, so do that up front here
+          tags.mkString(",")
+
+      val akkaSource = ctx.self.path.toString
+
+      val akkaAddress =
+        ctx.system match {
+          case adapter: ActorSystemAdapter[_] => adapter.provider.addressString
+          case _                              => Address("akka", ctx.system.name).toString
+        }
+
+      val sourceActorSystem = ctx.system.name
+
+      new LoggingContext(logger, tagsString, akkaSource, sourceActorSystem, akkaAddress, hasCustomName = false)
+    }
+  }
+
+  final case class LoggingContext(
+      logger: Logger,
+      tagsString: String,
+      akkaSource: String,
+      sourceActorSystem: String,
+      akkaAddress: String,
+      hasCustomName: Boolean) {
+    // toggled once per message if logging is used to avoid having to
+    // touch the mdc thread local for cleanup in the end
+    var mdcUsed = false
+
+    def withLogger(logger: Logger): LoggingContext = {
+      val l = copy(logger = logger, hasCustomName = true)
+      l.mdcUsed = mdcUsed
+      l
+    }
+  }
+
+}
 
 /**
  * INTERNAL API
@@ -29,9 +85,10 @@ import org.slf4j.LoggerFactory
     with javadsl.ActorContext[T]
     with scaladsl.ActorContext[T] {
 
+  import ActorContextImpl.LoggingContext
+
   // lazily initialized
-  private var logger: OptionVal[Logger] = OptionVal.None
-  private var mdcUsed: Boolean = false
+  private var _logging: OptionVal[LoggingContext] = OptionVal.None
 
   private var messageAdapterRef: OptionVal[ActorRef[Any]] = OptionVal.None
   private var _messageAdapters: List[(Class[_], Any => T)] = Nil
@@ -80,40 +137,45 @@ import org.slf4j.LoggerFactory
   override def getSystem: akka.actor.typed.ActorSystem[Void] =
     system.asInstanceOf[ActorSystem[Void]]
 
-  override def log: Logger = {
-    val l = logger match {
+  private def loggingContext(): LoggingContext = {
+    // lazy init of logging setup
+    _logging match {
       case OptionVal.Some(l) => l
       case OptionVal.None =>
         val logClass = LoggerClass.detectLoggerClassFromStack(classOf[Behavior[_]])
-        initLoggerWithName(logClass.getName)
+        val logger = LoggerFactory.getLogger(logClass.getName)
+        val l = LoggingContext(logger, classicActorContext.props.deploy.tags, this)
+        _logging = OptionVal.Some(l)
+        l
     }
-    // avoid access to MDC ThreadLocal if not needed
-    mdcUsed = true
-    ActorMdc.setMdc(self.path.toString)
-    l
+  }
+
+  override def log: Logger = {
+    val logging = loggingContext()
+    ActorMdc.setMdc(logging)
+    logging.logger
   }
 
   override def getLog: Logger = log
 
-  override def setLoggerName(name: String): Unit =
-    initLoggerWithName(name)
+  override def setLoggerName(name: String): Unit = {
+    _logging = OptionVal.Some(loggingContext().withLogger(LoggerFactory.getLogger(name)))
+  }
 
   override def setLoggerName(clazz: Class[_]): Unit =
     setLoggerName(clazz.getName)
 
+  def hasCustomLoggerName: Boolean = loggingContext().hasCustomName
+
   // MDC is cleared (if used) from aroundReceive in ActorAdapter after processing each message
   override private[akka] def clearMdc(): Unit = {
-    // avoid access to MDC ThreadLocal if not needed
-    if (mdcUsed) {
-      ActorMdc.clearMdc()
-      mdcUsed = false
+    // avoid access to MDC ThreadLocal if not needed, see details in LoggingContext
+    _logging match {
+      case OptionVal.Some(ctx) if ctx.mdcUsed =>
+        ActorMdc.clearMdc()
+        ctx.mdcUsed = false
+      case _ =>
     }
-  }
-
-  private def initLoggerWithName(name: String): Logger = {
-    val l = LoggerFactory.getLogger(name)
-    logger = OptionVal.Some(l)
-    l
   }
 
   override def setReceiveTimeout(d: java.time.Duration, msg: T): Unit =
@@ -149,7 +211,8 @@ import org.slf4j.LoggerFactory
 
   // Scala API impl
   def pipeToSelf[Value](future: Future[Value])(mapResult: Try[Value] => T): Unit = {
-    future.onComplete(value => self.unsafeUpcast ! AdaptMessage(value, mapResult))
+    future.onComplete(value => self.unsafeUpcast ! AdaptMessage(value, mapResult))(
+      ExecutionContexts.sameThreadExecutionContext)
   }
 
   // Java API impl
@@ -186,8 +249,9 @@ import org.slf4j.LoggerFactory
   private def internalMessageAdapter[U](messageClass: Class[U], f: U => T): ActorRef[U] = {
     // replace existing adapter for same class, only one per class is supported to avoid unbounded growth
     // in case "same" adapter is added repeatedly
-    _messageAdapters = (messageClass, f.asInstanceOf[Any => T]) ::
-      _messageAdapters.filterNot { case (cls, _) => cls == messageClass }
+    val boxedMessageClass = BoxedType(messageClass).asInstanceOf[Class[U]]
+    _messageAdapters = (boxedMessageClass, f.asInstanceOf[Any => T]) ::
+      _messageAdapters.filterNot { case (cls, _) => cls == boxedMessageClass }
     val ref = messageAdapterRef match {
       case OptionVal.Some(ref) => ref.asInstanceOf[ActorRef[U]]
       case OptionVal.None      =>

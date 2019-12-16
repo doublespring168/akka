@@ -5,7 +5,6 @@
 package akka.actor.typed.scaladsl.adapter
 
 import scala.util.control.NoStackTrace
-
 import akka.actor.InvalidMessageException
 import akka.actor.testkit.typed.TestException
 import akka.actor.typed.scaladsl.Behaviors
@@ -16,9 +15,11 @@ import akka.actor.typed.Terminated
 import akka.testkit._
 import akka.Done
 import akka.NotUsed
+import akka.actor.ActorInitializationException
 import akka.actor.testkit.typed.scaladsl.LogCapturing
 import akka.actor.testkit.typed.scaladsl.LoggingTestKit
 import akka.actor.typed.internal.adapter.SchedulerAdapter
+import akka.serialization.SerializationExtension
 import akka.{ actor => classic }
 import org.scalatest.{ BeforeAndAfterAll, Matchers, WordSpec }
 
@@ -29,6 +30,15 @@ object AdapterSpec {
     def receive = {
       case "ping"     => sender() ! "pong"
       case t: ThrowIt => throw t
+    }
+  }
+
+  val classicFailInConstructor: classic.Props = classic.Props(new ClassicFailInConstructor)
+
+  class ClassicFailInConstructor extends classic.Actor {
+    throw new TestException("Exception in constructor")
+    def receive = {
+      case "ping" => sender() ! "pong"
     }
   }
 
@@ -64,6 +74,10 @@ object AdapterSpec {
             context.watch(child)
             child ! ThrowIt3
             child.tell("ping", context.self.toClassic)
+            Behaviors.same
+          case "supervise-start-fail" =>
+            val child = context.actorOf(classicFailInConstructor)
+            context.watch(child)
             Behaviors.same
           case "stop-child" =>
             val child = context.actorOf(classic1)
@@ -169,6 +183,7 @@ class AdapterSpec extends WordSpec with Matchers with BeforeAndAfterAll with Log
   import AdapterSpec._
 
   implicit val system = akka.actor.ActorSystem("AdapterSpec")
+  def typedSystem: ActorSystem[Nothing] = system.toTyped
 
   "ActorSystem adaption" must {
     "only happen once for a given actor system" in {
@@ -209,6 +224,10 @@ class AdapterSpec extends WordSpec with Matchers with BeforeAndAfterAll with Log
       val typedScheduler = system.scheduler.toTyped
       typedScheduler.getClass should ===(classOf[SchedulerAdapter])
       (typedScheduler.toClassic should be).theSameInstanceAs(system.scheduler)
+    }
+
+    "allow seamless access to untyped extensions" in {
+      SerializationExtension(typedSystem) should not be (null)
     }
   }
 
@@ -290,9 +309,22 @@ class AdapterSpec extends WordSpec with Matchers with BeforeAndAfterAll with Log
       // only stop supervisorStrategy
       LoggingTestKit
         .error[AdapterSpec.ThrowIt3.type]
-        .intercept {
+        .expect {
           typedRef ! "supervise-restart"
           probe.expectMsg("ok")
+        }(system.toTyped)
+    }
+
+    "supervise classic child that throws in constructor from typed parent" in {
+      val probe = TestProbe()
+      val ignore = system.actorOf(classic.Props.empty)
+      val typedRef = system.spawnAnonymous(typed1(ignore, probe.ref))
+
+      LoggingTestKit
+        .error[ActorInitializationException]
+        .expect {
+          typedRef ! "supervise-start-fail"
+          probe.expectMsg("terminated")
         }(system.toTyped)
     }
 
@@ -316,7 +348,7 @@ class AdapterSpec extends WordSpec with Matchers with BeforeAndAfterAll with Log
       val throwMsg = "sad panda"
       LoggingTestKit
         .error("sad panda")
-        .intercept {
+        .expect {
           system.spawnAnonymous(unhappyTyped(throwMsg))
           Thread.sleep(1000)
         }(system.toTyped)

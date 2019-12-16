@@ -48,6 +48,7 @@ to your `application.conf` file:
 ```
 akka {
   actor {
+    # provider=remote is possible, but prefer cluster
     provider = cluster 
   }
   remote {
@@ -62,7 +63,7 @@ akka {
 
 As you can see in the example above there are four things you need to add to get started:
 
- * Change provider from `local` to `cluster`
+ * Change provider from `local`. We recommend using @ref:[Akka Cluster](cluster-usage.md) over using remoting directly.
  * Enable Artery to use it as the remoting implementation
  * Add host name - the machine you want to run the actor system on; this host
 name is exactly what is passed to remote systems in order to identify this
@@ -863,3 +864,12 @@ spec:
 There is currently no way to limit the size of a memory empty dir but there is a [pull request](https://github.com/kubernetes/kubernetes/pull/63641) for adding it.
 
 Any space used in the mount will count towards your container's memory usage.
+
+
+### Flight Recorder
+
+When running on JDK 11 Artery specific flight recording is available through the [Java Flight Recorder (JFR)](https://openjdk.java.net/jeps/328).
+The flight recorder is automatically enabled by detecting JDK 11 but can be disabled if needed by setting `akka.java-flight-recorder.enabled = false`.
+
+Low overhead Artery specific events are emitted by default when JFR is enabled, higher overhead events needs a custom settings template and are not enabled automatically with the `profiling` JFR template.
+To enable those create a copy of the `profiling` template and enable all `Akka` sub category events, for example through the JMC GUI. 

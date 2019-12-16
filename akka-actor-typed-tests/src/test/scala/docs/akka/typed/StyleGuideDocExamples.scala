@@ -123,7 +123,7 @@ object StyleGuideDocExamples {
                 name,
                 interval.toString,
                 n.toString)
-              timers.startTimerWithFixedDelay("repeat", Increment, interval)
+              timers.startTimerWithFixedDelay(Increment, interval)
               Behaviors.same
             case Increment =>
               val newValue = n + 1
@@ -166,7 +166,7 @@ object StyleGuideDocExamples {
               setup.name,
               interval,
               n)
-            setup.timers.startTimerWithFixedDelay("repeat", Increment, interval)
+            setup.timers.startTimerWithFixedDelay(Increment, interval)
             Behaviors.same
           case Increment =>
             val newValue = n + 1
@@ -213,7 +213,7 @@ object StyleGuideDocExamples {
               name,
               interval,
               n)
-            timers.startTimerWithFixedDelay("repeat", Increment, interval)
+            timers.startTimerWithFixedDelay(Increment, interval)
             Behaviors.same
           case Increment =>
             val newValue = n + 1
@@ -249,7 +249,7 @@ object StyleGuideDocExamples {
                     name,
                     interval,
                     n)
-                  timers.startTimerWithFixedDelay("repeat", Increment, interval)
+                  timers.startTimerWithFixedDelay(Increment, interval)
                   Behaviors.same
                 case Increment =>
                   val newValue = n + 1
@@ -341,7 +341,7 @@ object StyleGuideDocExamples {
       def apply(name: String, tickInterval: FiniteDuration): Behavior[Command] =
         Behaviors.setup { context =>
           Behaviors.withTimers { timers =>
-            timers.startTimerWithFixedDelay("tick", Tick, tickInterval)
+            timers.startTimerWithFixedDelay(Tick, tickInterval)
             new Counter(name, context).counter(0)
           }
         }
@@ -390,7 +390,7 @@ object StyleGuideDocExamples {
         Behaviors
           .setup[Counter.Message] { context =>
             Behaviors.withTimers { timers =>
-              timers.startTimerWithFixedDelay("tick", Tick, tickInterval)
+              timers.startTimerWithFixedDelay(Tick, tickInterval)
               new Counter(name, context).counter(0)
             }
           }
@@ -422,14 +422,13 @@ object StyleGuideDocExamples {
   object Ask {
     import Messages.CounterProtocol._
 
-    val system: ActorSystem[Nothing] = ???
+    implicit val system: ActorSystem[Nothing] = ???
 
     //#ask-1
     import akka.actor.typed.scaladsl.AskPattern._
     import akka.util.Timeout
 
     implicit val timeout = Timeout(3.seconds)
-    implicit val scheduler = system.scheduler
     val counter: ActorRef[Command] = ???
 
     val result: Future[OperationResult] = counter.ask(replyTo => Increment(delta = 2, replyTo))

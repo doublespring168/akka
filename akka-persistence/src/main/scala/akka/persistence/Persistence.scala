@@ -158,6 +158,8 @@ object Persistence extends ExtensionId[Persistence] with ExtensionIdProvider {
   /** Java API. */
   override def get(system: ActorSystem): Persistence = super.get(system)
 
+  override def get(system: ClassicActorSystemProvider): Persistence = super.get(system)
+
   def createExtension(system: ExtendedActorSystem): Persistence = new Persistence(system)
 
   def lookup() = Persistence
@@ -206,7 +208,7 @@ class Persistence(val system: ExtendedActorSystem) extends Extension {
 
   import Persistence._
 
-  private def log: LoggingAdapter = Logging(system, getClass.getName)
+  private def log: LoggingAdapter = Logging(system, getClass)
 
   private val NoSnapshotStorePluginId = "akka.persistence.no-snapshot-store"
 

@@ -11,6 +11,8 @@ import java.time.format.DateTimeFormatter
 import java.time.ZonedDateTime
 import java.time.ZoneOffset
 import com.lightbend.paradox.projectinfo.ParadoxProjectInfoPluginKeys._
+import com.typesafe.sbt.MultiJvmPlugin.autoImport.MultiJvm
+import sbtassembly.AssemblyPlugin.autoImport._
 
 import sbt.Keys._
 import sbt._
@@ -119,7 +121,13 @@ object AkkaBuild {
 
   private def allWarnings: Boolean = System.getProperty("akka.allwarnings", "false").toBoolean
 
-  final val DefaultScalacOptions = Seq("-encoding", "UTF-8", "-feature", "-unchecked", "-Xlog-reflective-calls")
+  final val DefaultScalacOptions = Seq(
+    "-encoding", "UTF-8",
+    "-feature",
+    "-unchecked",
+    "-Xlog-reflective-calls",
+    // 'blessed' since 2.13.1
+    "-language:higherKinds")
 
   // -XDignore.symbol.file suppresses sun.misc.Unsafe warnings
   final val DefaultJavacOptions = Seq("-encoding", "UTF-8", "-Xlint:unchecked", "-XDignore.symbol.file")
@@ -127,19 +135,17 @@ object AkkaBuild {
   lazy val defaultSettings: Seq[Setting[_]] = Def.settings(
     resolverSettings,
     TestExtras.Filter.settings,
-    Protobuf.settings,
-
     // compile options
     scalacOptions in Compile ++= DefaultScalacOptions,
     scalacOptions in Compile ++=
-      JdkOptions.targetJdkScalacOptions(targetSystemJdk.value, fullJavaHomes.value),
+      JdkOptions.targetJdkScalacOptions(targetSystemJdk.value, optionalDir(jdk8home.value), fullJavaHomes.value),
     scalacOptions in Compile ++= (if (allWarnings) Seq("-deprecation") else Nil),
     scalacOptions in Test := (scalacOptions in Test).value.filterNot(opt =>
       opt == "-Xlog-reflective-calls" || opt.contains("genjavadoc")),
     javacOptions in compile ++= DefaultJavacOptions ++
-      JdkOptions.targetJdkJavacOptions(targetSystemJdk.value, fullJavaHomes.value),
+      JdkOptions.targetJdkJavacOptions(targetSystemJdk.value, optionalDir(jdk8home.value), fullJavaHomes.value),
     javacOptions in test ++= DefaultJavacOptions ++
-      JdkOptions.targetJdkJavacOptions(targetSystemJdk.value, fullJavaHomes.value),
+      JdkOptions.targetJdkJavacOptions(targetSystemJdk.value, optionalDir(jdk8home.value), fullJavaHomes.value),
     javacOptions in compile ++= (if (allWarnings) Seq("-Xlint:deprecation") else Nil),
     javacOptions in doc ++= Seq(),
 
@@ -251,7 +257,23 @@ object AkkaBuild {
     mavenLocalResolverSettings,
     docLintingSettings,
     JdkOptions.targetJdkSettings,
+
+    // a workaround for https://github.com/akka/akka/issues/27661
+    // see also project/Protobuf.scala that introduces /../ to make "intellij happy"
+    MultiJvm / assembly / fullClasspath := {
+      val old = (MultiJvm / assembly / fullClasspath).value.toVector
+      val files = old.map(_.data.getCanonicalFile).distinct
+      files map { x => Attributed.blank(x) }
+    },
   )
+
+  private def optionalDir(path: String): Option[File] =
+    Option(path).filter(_.nonEmpty).map { path =>
+      val dir = new File(path)
+      if (!dir.exists)
+        throw new IllegalArgumentException(s"Path [$path] not found")
+      dir
+    }
 
   lazy val docLintingSettings = Seq(
     javacOptions in compile ++= Seq("-Xdoclint:none"),

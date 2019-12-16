@@ -25,6 +25,7 @@ import scala.collection.immutable
 import scala.compat.java8.FutureConverters
 import scala.compat.java8.OptionConverters._
 import scala.concurrent.duration.Duration
+import scala.concurrent.blocking
 import scala.concurrent.{ ExecutionContext, ExecutionContextExecutor, Future, Promise }
 import scala.util.control.{ ControlThrowable, NonFatal }
 import scala.util.{ Failure, Success, Try }
@@ -999,6 +1000,7 @@ private[akka] class ActorSystemImpl(
       "akka-coordination",
       "akka-discovery",
       "akka-distributed-data",
+      "akka-testkit",
       "akka-multi-node-testkit",
       "akka-osgi",
       "akka-persistence",
@@ -1037,7 +1039,8 @@ private[akka] class ActorSystemImpl(
       logDeadLetterListener = Some(systemActorOf(Props[DeadLetterListener], "deadLetterListener"))
     eventStream.startUnsubscriber()
     ManifestInfo(this).checkSameVersion("Akka", allModules, logWarning = true)
-    loadExtensions()
+    if (!terminating)
+      loadExtensions()
     if (LogConfigOnStart) logConfiguration()
     this
   } catch {
@@ -1051,7 +1054,10 @@ private[akka] class ActorSystemImpl(
   def registerOnTermination[T](code: => T): Unit = { registerOnTermination(new Runnable { def run = code }) }
   def registerOnTermination(code: Runnable): Unit = { terminationCallbacks.add(code) }
 
+  @volatile private var terminating = false
+
   override def terminate(): Future[Terminated] = {
+    terminating = true
     if (settings.CoordinatedShutdownRunByActorSystemTerminate && !aborting) {
       // Note that the combination CoordinatedShutdownRunByActorSystemTerminate==true &&
       // CoordinatedShutdownTerminateActorSystem==false is disallowed, checked in Settings.
@@ -1068,6 +1074,7 @@ private[akka] class ActorSystemImpl(
   }
 
   override private[akka] def finalTerminate(): Unit = {
+    terminating = true
     // these actions are idempotent
     if (!settings.LogDeadLettersDuringShutdown) logDeadLetterListener.foreach(stop)
     guardian.stop()
@@ -1125,7 +1132,10 @@ private[akka] class ActorSystemImpl(
   @tailrec
   private def findExtension[T <: Extension](ext: ExtensionId[T]): T = extensions.get(ext) match {
     case c: CountDownLatch =>
-      c.await(); findExtension(ext) //Registration in process, await completion and retry
+      blocking {
+        c.await()
+      }
+      findExtension(ext) //Registration in process, await completion and retry
     case t: Throwable => throw t //Initialization failed, throw same again
     case other =>
       other.asInstanceOf[T] //could be a T or null, in which case we return the null as T
@@ -1170,15 +1180,19 @@ private[akka] class ActorSystemImpl(
   private def loadExtensions(): Unit = {
 
     /*
-     * @param throwOnLoadFail Throw exception when an extension fails to load (needed for backwards compatibility)
+     * @param throwOnLoadFail
+     *  Throw exception when an extension fails to load (needed for backwards compatibility.
+     *    when the extension cannot be found at all we throw regardless of this setting)
      */
     def loadExtensions(key: String, throwOnLoadFail: Boolean): Unit = {
       immutableSeq(settings.config.getStringList(key)).foreach { fqcn =>
         dynamicAccess.getObjectFor[AnyRef](fqcn).recoverWith {
           case _ => dynamicAccess.createInstanceFor[AnyRef](fqcn, Nil)
         } match {
-          case Success(p: ExtensionIdProvider) => registerExtension(p.lookup())
-          case Success(p: ExtensionId[_])      => registerExtension(p)
+          case Success(p: ExtensionIdProvider) =>
+            registerExtension(p.lookup())
+          case Success(p: ExtensionId[_]) =>
+            registerExtension(p)
           case Success(_) =>
             if (!throwOnLoadFail) log.error("[{}] is not an 'ExtensionIdProvider' or 'ExtensionId', skipping...", fqcn)
             else throw new RuntimeException(s"[$fqcn] is not an 'ExtensionIdProvider' or 'ExtensionId'")
@@ -1203,8 +1217,10 @@ private[akka] class ActorSystemImpl(
           (if (indent.isEmpty) "-> " else indent.dropRight(1) + "⌊-> ") +
           node.path.name + " " + Logging.simpleName(node) + " " +
           (cell match {
-            case real: ActorCell => if (real.actor ne null) real.actor.getClass else "null"
-            case _               => Logging.simpleName(cell)
+            case real: ActorCell =>
+              val realActor = real.actor
+              if (realActor ne null) realActor.getClass else "null"
+            case _ => Logging.simpleName(cell)
           }) +
           (cell match {
             case real: ActorCell => " status=" + real.mailbox.currentStatus
